@@ -76,21 +76,19 @@ cdef class ConnectedMatterAgent:
         self.goal_components = self.find_connected_components(self.goal_positions)
         self.multi_component_goal = len(self.goal_components) > 1
         
-        # Force disconnection to be allowed for multi-component goals
+        # CRITICAL FIX: Force disconnection to be allowed for multi-component goals
         if self.multi_component_goal:
             self.allow_disconnection = True
-            print("Multiple disconnected components detected - enabling component separation")
-        else:
-            # Default for single-component goals
-            self.allow_disconnection = False
-        
-        if self.multi_component_goal:
-            print(f"Goal has {len(self.goal_components)} disconnected components")
+            print(f"Multiple disconnected components detected - enabling component separation")
             # Calculate centroid for each component
             self.goal_component_centroids = [self.calculate_centroid(component) 
                                             for component in self.goal_components]
             for i, (component, centroid) in enumerate(zip(self.goal_components, self.goal_component_centroids)):
                 print(f"Component {i+1}: {len(component)} blocks, centroid at {centroid}")
+        else:
+            # Default for single-component goals
+            self.allow_disconnection = False
+            self.goal_component_centroids = []
         
         # Calculate the centroid of all goal positions (still useful for overall movement)
         self.goal_centroid = self.calculate_centroid(self.goal_positions)
@@ -103,6 +101,43 @@ cdef class ConnectedMatterAgent:
             if self.multi_component_goal:
                 # Select blocks for each component separately based on proximity to component centroids
                 self.target_block_list = self.select_blocks_for_components()
+                
+                # CRITICAL FIX: Verify block assignment
+                if len(self.target_block_list) != len(self.goal_positions):
+                    print(f"WARNING: Selected {len(self.target_block_list)} blocks but need {len(self.goal_positions)}")
+                    # Try to fix by selecting exactly the right number of blocks
+                    if len(self.target_block_list) < len(self.goal_positions):
+                        # Find more blocks to add
+                        additional_needed = len(self.goal_positions) - len(self.target_block_list)
+                        print(f"Attempting to find {additional_needed} additional blocks")
+                        
+                        # Find unassigned blocks
+                        unassigned = [pos for pos in self.start_positions if pos not in self.target_block_list]
+                        # Add blocks up to the needed amount
+                        self.target_block_list.extend(unassigned[:additional_needed])
+                        
+                        # Assign these to components that need more blocks
+                        for i, pos in enumerate(unassigned[:additional_needed]):
+                            # Find component with fewest blocks
+                            component_counts = {}
+                            for p, comp_idx in self.block_component_assignment.items():
+                                component_counts[comp_idx] = component_counts.get(comp_idx, 0) + 1
+                            
+                            target_comp = min(range(len(self.goal_components)), 
+                                             key=lambda c: component_counts.get(c, 0))
+                            self.block_component_assignment[pos] = target_comp
+                            print(f"Assigned additional block at {pos} to Component {target_comp+1}")
+                    elif len(self.target_block_list) > len(self.goal_positions):
+                        # Remove excess blocks
+                        excess = len(self.target_block_list) - len(self.goal_positions)
+                        print(f"Removing {excess} excess blocks")
+                        removed = self.target_block_list[len(self.goal_positions):]
+                        self.target_block_list = self.target_block_list[:len(self.goal_positions)]
+                        
+                        # Remove these from block_component_assignment
+                        for pos in removed:
+                            if pos in self.block_component_assignment:
+                                del self.block_component_assignment[pos]
             else:
                 # Standard selection for single-component goals
                 self.target_block_list = self.select_closest_blocks_to_goal()
@@ -141,6 +176,10 @@ cdef class ConnectedMatterAgent:
         if self.multi_component_goal and self.allow_disconnection:
             self._analyze_goal_components()
             
+        # CRITICAL FIX: Validate component assignments
+        if self.multi_component_goal and self.allow_disconnection:
+            self._validate_component_assignments()
+
     def _analyze_goal_components(self):
         """Analyze goal components for better planning"""
         print("Analyzing disconnected goal components...")
@@ -274,74 +313,56 @@ cdef class ConnectedMatterAgent:
     def select_blocks_for_components(self):
         """
         Enhanced method to select blocks for each component in multi-component goals
-        - Uses weighted distance metrics to better assign blocks
-        - Considers component size and proximity
         """
         print("Selecting blocks for multiple goal components...")
-        
-        # Calculate distances from each start position to each component centroid
-        block_distances = []
-        for pos in self.start_positions:
-            distances = []
-            for i, centroid in enumerate(self.goal_component_centroids):
-                # Manhattan distance to component centroid
-                dist = abs(pos[0] - centroid[0]) + abs(pos[1] - centroid[1])
-                
-                # Apply component size weighting (larger components get priority)
-                component_size = len(self.goal_components[i])
-                size_weight = 1.0 - (component_size / len(self.goal_positions)) * 0.2
-                weighted_dist = dist * size_weight
-                
-                distances.append((weighted_dist, dist, i, pos))  # (weighted_distance, raw_distance, component_index, position)
-            
-            # Add the best match for this position
-            distances.sort()  # Sort by weighted distance
-            block_distances.append(distances[0])  # Keep best match for each block
-        
-        # Sort blocks by weighted distance
-        block_distances.sort()  # This sorts by weighted distance across all blocks
         
         # Initialize component assignments
         component_blocks = {i: [] for i in range(len(self.goal_components))}
         block_component_assignment = {}
         
-        # Assign blocks to components based on size requirements
-        assigned_blocks = []
+        # Calculate centroids for each component
+        component_centroids = [self.calculate_centroid(component) for component in self.goal_components]
         
-        # First pass: assign blocks to closest component if there's room
-        for weighted_dist, raw_dist, comp_idx, pos in block_distances:
-            # Skip if this block is already assigned
-            if pos in assigned_blocks:
-                continue
-                
-            component = self.goal_components[comp_idx]
+        # First pass: Assign minimum blocks to each component
+        remaining_blocks = list(self.start_positions)
+        
+        for comp_idx, component in enumerate(self.goal_components):
+            required_blocks = len(component)
+            centroid = component_centroids[comp_idx]
             
-            # If this component still needs blocks, assign this block to it
-            if len(component_blocks[comp_idx]) < len(component):
+            # Sort blocks by distance to this component's centroid
+            block_distances = []
+            for pos in remaining_blocks:
+                dist = abs(pos[0] - centroid[0]) + abs(pos[1] - centroid[1])
+                block_distances.append((dist, pos))
+            
+            block_distances.sort()  # Sort by distance
+            
+            # Assign blocks to this component
+            for i in range(min(required_blocks, len(block_distances))):
+                _, pos = block_distances[i]
                 component_blocks[comp_idx].append(pos)
                 block_component_assignment[pos] = comp_idx
-                assigned_blocks.append(pos)
-                print(f"  Assigned block at {pos} to Component {comp_idx+1} (distance: {raw_dist:.2f})")
-        
-        # Second pass: If any components still need blocks, assign remaining blocks
-        for comp_idx, blocks in component_blocks.items():
-            component = self.goal_components[comp_idx]
-            if len(blocks) < len(component):
-                # How many more blocks needed for this component
-                blocks_needed = len(component) - len(blocks)
-                print(f"  Component {comp_idx+1} still needs {blocks_needed} more blocks")
+                remaining_blocks.remove(pos)
                 
-                # Find closest unassigned blocks
-                for _, raw_dist, _, pos in block_distances:
-                    if pos not in assigned_blocks:
-                        component_blocks[comp_idx].append(pos)
-                        block_component_assignment[pos] = comp_idx
-                        assigned_blocks.append(pos)
-                        print(f"  Assigned additional block at {pos} to Component {comp_idx+1}")
-                        
-                        blocks_needed -= 1
-                        if blocks_needed == 0:
-                            break
+            print(f"  Assigned {len(component_blocks[comp_idx])}/{required_blocks} blocks to Component {comp_idx+1}")
+        
+        # Add any unassigned blocks to components that need more
+        for comp_idx, blocks in component_blocks.items():
+            required = len(self.goal_components[comp_idx])
+            if len(blocks) < required and remaining_blocks:
+                # How many more blocks needed
+                needed = required - len(blocks)
+                # Take up to that many from remaining blocks
+                additional = remaining_blocks[:needed]
+                
+                # Add to this component
+                for pos in additional:
+                    component_blocks[comp_idx].append(pos)
+                    block_component_assignment[pos] = comp_idx
+                    remaining_blocks.remove(pos)
+                    
+                print(f"  Added {len(additional)} more blocks to Component {comp_idx+1}")
         
         # Store the component assignment for later use
         self.block_component_assignment = block_component_assignment
@@ -358,7 +379,7 @@ cdef class ConnectedMatterAgent:
         """Run parallel searches for each component"""
         print(f"Starting parallel search for {len(self.goal_components)} disconnected components...")
         
-        # Validate component assignments to ensure each component has the right blocks
+        # Make sure component assignments are valid
         self._validate_component_assignments()
         
         # Create component tasks
@@ -366,7 +387,7 @@ cdef class ConnectedMatterAgent:
         for comp_idx in range(len(self.goal_components)):
             # Get blocks assigned to this component
             component_blocks = [pos for pos in self.target_block_list 
-                             if self.block_component_assignment.get(pos) == comp_idx]
+                            if self.block_component_assignment.get(pos) == comp_idx]
             
             if not component_blocks:
                 print(f"No blocks assigned to Component {comp_idx+1}, skipping")
@@ -378,18 +399,25 @@ cdef class ConnectedMatterAgent:
         # Allocate time for each component
         component_time_limit = time_limit / max(1, len(component_tasks))
         
-        # Run searches sequentially (safer than multiprocessing with Cython)
+        # Run searches sequentially
         component_results = []
         for comp_idx, blocks in component_tasks:
             print(f"Searching for Component {comp_idx+1} with {len(blocks)} blocks")
             result = self.search_single_component(comp_idx, self.start_state, blocks, component_time_limit)
             component_results.append(result)
+            print(f"Completed search for Component {comp_idx+1}, path length: {len(result[1]) if result and result[1] else 0}")
         
         # Combine results
         merged_path = self.merge_component_paths(component_results)
         
-        # Final check for overlapping blocks in the path
-        merged_path = self._fix_overlapping_blocks_in_path(merged_path)
+        # Make sure all blocks are in the final path
+        if merged_path:
+            final_state = merged_path[-1]
+            expected_count = len(self.target_block_list)
+            actual_count = len(final_state)
+            
+            if actual_count < expected_count:
+                print(f"WARNING: Final state has {actual_count} blocks but expected {expected_count}")
         
         return merged_path
 
@@ -470,10 +498,13 @@ cdef class ConnectedMatterAgent:
         if not self.multi_component_goal or not self.allow_disconnection:
             return self.is_connected(state)
         
-        # Extract target blocks
-        target_blocks = [pos for pos in state if pos not in self.non_target_state]
+        # Convert state to list if needed
+        state_list = list(state) if isinstance(state, frozenset) else state
         
-        # Group blocks by their assigned component
+        # Extract target blocks (exclude fixed blocks)
+        target_blocks = [pos for pos in state_list if pos not in self.non_target_state]
+        
+        # CRITICAL FIX: Group blocks by their assigned component
         component_blocks = {}
         for pos in target_blocks:
             if pos in self.block_component_assignment:
@@ -482,13 +513,14 @@ cdef class ConnectedMatterAgent:
                     component_blocks[comp_idx] = []
                 component_blocks[comp_idx].append(pos)
         
-        # Check connectivity ONLY within each component (not between components)
+        # CRITICAL FIX: Check connectivity ONLY within each component (not between components)
         for comp_idx, blocks in component_blocks.items():
             if len(blocks) > 1 and not self.is_connected(blocks):
                 return False
         
+        # IMPORTANT: Return True even if components are disconnected from each other
         return True
-        
+
     def get_articulation_points(self, state_set):
         """
         Find articulation points (critical points that if removed would disconnect the structure)
@@ -599,7 +631,7 @@ cdef class ConnectedMatterAgent:
         Fixed blocks remain stationary
         For multi-component goals, each component can move independently
         
-        Enhanced with stricter overlap prevention
+        Enhanced with stricter overlap prevention and proper disconnection support
         """
         valid_moves = []
         
@@ -690,7 +722,8 @@ cdef class ConnectedMatterAgent:
                         
                         # Perform a final overlap check before adding to valid moves
                         if not self.has_overlapping_blocks(new_state):
-                            # Only check connectivity WITHIN this component, not between components
+                            # CRITICAL FIX: Only check connectivity WITHIN this component, not between components
+                            # This allows components to disconnect from each other
                             if len(new_positions) <= 1 or self.is_connected(new_positions):
                                 valid_moves.append(frozenset(new_state))
         else:
@@ -749,7 +782,7 @@ cdef class ConnectedMatterAgent:
                                 valid_moves.append(new_state)
         
         return valid_moves
-    
+
     def get_valid_morphing_moves(self, state):
         """
         Generate valid morphing moves
@@ -1426,6 +1459,7 @@ cdef class ConnectedMatterAgent:
     def get_all_valid_moves(self, state):
         """
         Combine all move generation methods to maximize options
+        Allow proper disconnection for multi-component goals
         """
         # Skip states with overlapping blocks
         if self.has_overlapping_blocks(state):
@@ -1440,8 +1474,13 @@ cdef class ConnectedMatterAgent:
         # Add sliding chain moves
         sliding_moves = self.get_sliding_chain_moves(state)
         
-        # Combine all moves (frozensets automatically handle duplicates)
-        all_moves = list(set(basic_moves + chain_moves + sliding_moves))
+        # CRITICAL FIX: For multi-component goals, add "disconnection moves"
+        if self.allow_disconnection and self.multi_component_goal:
+            disconnection_moves = self._generate_component_separation_moves(state)
+            all_moves = list(set(basic_moves + chain_moves + sliding_moves + disconnection_moves))
+        else:
+            # Regular combined moves
+            all_moves = list(set(basic_moves + chain_moves + sliding_moves))
         
         # Final check for overlapping blocks
         all_moves = [move for move in all_moves if not self.has_overlapping_blocks(move)]
@@ -1997,34 +2036,70 @@ cdef class ConnectedMatterAgent:
         """Search for a single component"""
         print(f"Starting search for Component {comp_idx+1} with {len(target_blocks)} blocks")
         
-        # Create a focused agent for this component
-        local_agent = ConnectedMatterAgent(
-            self.grid_size,
-            self.start_positions,
-            self.goal_components[comp_idx],  # Use only this component's goal positions
-            self.topology,
-            self.max_simultaneous_moves,
-            self.min_simultaneous_moves,
-            False  # No multiprocessing for sub-components
-        )
+        # Create goal state for this component
+        component_goal = self.goal_components[comp_idx]
         
-        # Configure the agent for this component
-        local_agent.target_block_list = target_blocks
-        local_agent.fixed_block_list = [pos for pos in self.start_positions if pos not in target_blocks]
-        local_agent.target_state = frozenset(target_blocks)
-        local_agent.non_target_state = frozenset(local_agent.fixed_block_list)
-        local_agent.allow_disconnection = True
-        local_agent.multi_component_goal = False  # This is now a single-component task
+        # Direct implementation rather than creating a new agent
+        # (a) Block movement phase
+        block_time_limit = time_limit * 0.3
         
-        # Create a simple 1:1 block assignment
-        local_agent.block_component_assignment = {pos: 0 for pos in target_blocks}
+        # First, get blocks to the vicinity of the goal component
+        component_centroid = self.goal_component_centroids[comp_idx]
         
-        # Run search
-        path = local_agent.search(time_limit)
-        print(f"Completed search for Component {comp_idx+1}")
+        # Initial state includes all blocks
+        initial_state = start_state
+        g_score = {initial_state: 0}
+        came_from = {initial_state: None}
         
-        return comp_idx, path
-    
+        # Simple distance heuristic for this component
+        def component_heuristic(state):
+            # Extract target blocks for this component
+            comp_blocks = [pos for pos in state 
+                        if pos in self.block_component_assignment and 
+                        self.block_component_assignment[pos] == comp_idx]
+            
+            if not comp_blocks:
+                return float('inf')
+            
+            # Calculate centroid distance
+            comp_centroid = self.calculate_centroid(comp_blocks)
+            return abs(comp_centroid[0] - component_centroid[0]) + abs(comp_centroid[1] - component_centroid[1])
+        
+        # Run simple A* search to get blocks near goal
+        open_set = [(component_heuristic(initial_state), 0, initial_state)]
+        start_time = time.time()
+        
+        while open_set and time.time() - start_time < block_time_limit:
+            f, g, current = heapq.heappop(open_set)
+            
+            # Check if close enough to goal
+            if component_heuristic(current) <= 2.0:
+                break
+                
+            # Generate neighbors
+            for neighbor in self.get_valid_block_moves(current):
+                tentative_g = g_score[current] + 1
+                
+                if neighbor not in g_score or tentative_g < g_score[neighbor]:
+                    g_score[neighbor] = tentative_g
+                    came_from[neighbor] = current
+                    f_score = tentative_g + component_heuristic(neighbor)
+                    heapq.heappush(open_set, (f_score, tentative_g, neighbor))
+        
+        # Get the best state
+        block_final_state = min(g_score.keys(), key=component_heuristic)
+        block_path = self.reconstruct_path(came_from, block_final_state)
+        
+        # (b) Morphing phase
+        morphing_time_limit = time_limit * 0.7
+        morphing_path = self.smarter_morphing_phase(frozenset(block_final_state), morphing_time_limit)
+        
+        # Combine paths
+        combined_path = block_path[:-1] + morphing_path if morphing_path else block_path
+        
+        print(f"Completed search for Component {comp_idx+1}, path length: {len(combined_path)}")
+        return (comp_idx, combined_path)
+
     def search_multi_component(self, time_limit=30):
         """
         Run parallel searches for each component in a multi-component goal
@@ -2101,14 +2176,19 @@ cdef class ConnectedMatterAgent:
             return []
         
         # Extract valid paths
-        valid_paths = [(idx, path) for idx, path in component_results if path]
+        valid_paths = []
+        for result in component_results:
+            if result and isinstance(result, tuple) and len(result) == 2:
+                comp_idx, path = result
+                if path:  # Only add non-empty paths
+                    valid_paths.append((comp_idx, path))
         
         if not valid_paths:
             print("No valid component paths found!")
             return []
         
         # Start with the first component's path
-        first_idx, first_path = valid_paths[0]
+        first_comp_idx, first_path = valid_paths[0]
         merged_path = []
         
         # Copy the first path correctly to start with
@@ -2116,14 +2196,16 @@ cdef class ConnectedMatterAgent:
             if isinstance(state, frozenset):
                 merged_path.append(list(state))
             else:
-                merged_path.append(state.copy())
+                merged_path.append(list(state))  # Make a copy of the state list
+        
+        # Tracking which components have been merged at each step
+        merged_components = {i: [first_comp_idx] for i in range(len(merged_path))}
         
         # Merge with each additional component
         for comp_idx, path in valid_paths[1:]:
-            if not path:
-                continue
-                
-            # For each step in the combined path, update with this component's blocks
+            print(f"Merging path for Component {comp_idx+1} (length: {len(path)})")
+            
+            # For each step in the path, update with this component's blocks
             for i in range(min(len(merged_path), len(path))):
                 current_state = merged_path[i]
                 component_state = path[i]
@@ -2132,26 +2214,36 @@ cdef class ConnectedMatterAgent:
                 if isinstance(component_state, frozenset):
                     component_state = list(component_state)
                 
+                # If this component has already been merged for this state, skip
+                if comp_idx in merged_components[i]:
+                    continue
+                
                 # Remove blocks from this component in current state
-                current_state = [pos for pos in current_state 
-                               if pos not in self.block_component_assignment or 
-                                 self.block_component_assignment[pos] != comp_idx]
+                # (they'll be replaced with the correct positions from component_state)
+                filtered_state = []
+                for pos in current_state:
+                    if (pos not in self.block_component_assignment or 
+                        self.block_component_assignment[pos] != comp_idx):
+                        filtered_state.append(pos)
                 
                 # Add blocks from this component's state
                 for pos in component_state:
                     if pos in self.block_component_assignment and self.block_component_assignment[pos] == comp_idx:
-                        current_state.append(pos)
+                        filtered_state.append(pos)
                 
-                # Update the merged path
-                merged_path[i] = current_state
+                # Update the merged path and track the merged component
+                merged_path[i] = filtered_state
+                merged_components[i].append(comp_idx)
             
             # If component path is longer, add its remaining states
             if len(path) > len(merged_path):
                 for i in range(len(merged_path), len(path)):
                     # Get all blocks except this component from the last merged state
-                    base_state = [pos for pos in merged_path[-1] 
-                                if pos not in self.block_component_assignment or 
-                                  self.block_component_assignment[pos] != comp_idx]
+                    base_state = []
+                    for pos in merged_path[-1]:
+                        if (pos not in self.block_component_assignment or 
+                            self.block_component_assignment[pos] != comp_idx):
+                            base_state.append(pos)
                     
                     # Add this component's blocks from its current state
                     component_state = path[i]
@@ -2162,13 +2254,34 @@ cdef class ConnectedMatterAgent:
                         if pos in self.block_component_assignment and self.block_component_assignment[pos] == comp_idx:
                             base_state.append(pos)
                     
-                    # Add to the merged path
+                    # Add to the merged path with new component tracking
                     merged_path.append(base_state)
+                    # Create new entry in merged_components for this step
+                    merged_components[i] = [comp_idx] + merged_components[len(merged_path)-2]
+        
+        # Final check for missing blocks
+        for i, state in enumerate(merged_path):
+            # Check if all components are included
+            missing_components = []
+            for comp_idx in range(len(self.goal_components)):
+                if comp_idx not in merged_components[i]:
+                    missing_components.append(comp_idx)
+            
+            # If components are missing, use their positions from the previous state
+            if missing_components and i > 0:
+                prev_state = merged_path[i-1]
+                for pos in prev_state:
+                    if (pos in self.block_component_assignment and 
+                        self.block_component_assignment[pos] in missing_components and
+                        pos not in state):
+                        state.append(pos)
+                        merged_components[i].append(self.block_component_assignment[pos])
         
         # Final check for overlapping blocks
         for i, state in enumerate(merged_path):
+            # Check for duplicates
             if len(state) != len(set(state)):
-                print(f"WARNING: Overlapping blocks in merged state {i}")
+                print(f"WARNING: Overlapping blocks in merged state {i}, removing duplicates")
                 # Fix by removing duplicates
                 merged_path[i] = list(set(state))
         
@@ -2492,6 +2605,102 @@ cdef class ConnectedMatterAgent:
         
         path.reverse()
         return path
+    def _generate_component_separation_moves(self, state):
+        """
+        Generate special moves that encourage components to separate
+        This is critical for allowing blocks to disconnect into separate shapes
+        """
+        valid_moves = []
+        
+        # Skip if not a multi-component goal with disconnection allowed
+        if not (self.multi_component_goal and self.allow_disconnection):
+            return valid_moves
+        
+        # Convert state to list if needed
+        state_list = list(state) if isinstance(state, frozenset) else state
+        
+        # Group blocks by component
+        component_blocks = {}
+        for pos in state_list:
+            if pos in self.block_component_assignment:
+                comp_idx = self.block_component_assignment[pos]
+                if comp_idx not in component_blocks:
+                    component_blocks[comp_idx] = []
+                component_blocks[comp_idx].append(pos)
+        
+        # For each component, try moving blocks toward their goal centroid
+        for comp_idx, blocks in component_blocks.items():
+            if len(blocks) <= 0 or comp_idx >= len(self.goal_component_centroids):
+                continue
+                
+            goal_centroid = self.goal_component_centroids[comp_idx]
+            
+            # Find the block in this component that's farthest from the goal
+            farthest_block = None
+            max_dist = -1
+            
+            for pos in blocks:
+                dist = abs(pos[0] - goal_centroid[0]) + abs(pos[1] - goal_centroid[1])
+                if dist > max_dist:
+                    max_dist = dist
+                    farthest_block = pos
+            
+            if not farthest_block:
+                continue
+                
+            # Try to move this block closer to the goal centroid
+            dx = 1 if goal_centroid[0] > farthest_block[0] else -1 if goal_centroid[0] < farthest_block[0] else 0
+            dy = 1 if goal_centroid[1] > farthest_block[1] else -1 if goal_centroid[1] < farthest_block[1] else 0
+            
+            # Try the move
+            new_pos = (farthest_block[0] + dx, farthest_block[1] + dy)
+            
+            # Skip if out of bounds
+            if not (0 <= new_pos[0] < self.grid_size[0] and 0 <= new_pos[1] < self.grid_size[1]):
+                continue
+                
+            # Skip if already occupied
+            if new_pos in state_list:
+                continue
+                
+            # Create a new state with this block moved
+            new_state = [pos if pos != farthest_block else new_pos for pos in state_list]
+            
+            # Check if the component remains connected after the move
+            comp_blocks_after = [pos for pos in new_state 
+                               if pos in self.block_component_assignment and 
+                               self.block_component_assignment[pos] == comp_idx]
+            
+            # CRITICAL: Use is_connected only for this component's blocks
+            if len(comp_blocks_after) <= 1 or self.is_connected(comp_blocks_after):
+                valid_moves.append(frozenset(new_state))
+            
+            # If that failed, try moving the component as a whole
+            if not valid_moves:
+                # Try moving all blocks in this component together
+                new_positions = [(pos[0] + dx, pos[1] + dy) for pos in blocks]
+                
+                # Check if all new positions are valid
+                all_valid = True
+                other_blocks = [pos for pos in state_list if pos not in blocks]
+                
+                for pos in new_positions:
+                    # Check bounds
+                    if not (0 <= pos[0] < self.grid_size[0] and 0 <= pos[1] < self.grid_size[1]):
+                        all_valid = False
+                        break
+                        
+                    # Check collision with other blocks
+                    if pos in other_blocks:
+                        all_valid = False
+                        break
+                
+                if all_valid:
+                    # Create a new state with these blocks moved
+                    new_state = other_blocks + new_positions
+                    valid_moves.append(frozenset(new_state))
+        
+        return valid_moves
 
 # Override search method
     def search(self, double time_limit=30):
@@ -2499,6 +2708,9 @@ cdef class ConnectedMatterAgent:
         # For disconnected goals, use component-specific search
         if self.multi_component_goal and self.allow_disconnection:
             print("Using component-specific search for disconnected goal shapes")
+            
+            # CRITICAL FIX: Force disconnection to be allowed
+            self.allow_disconnection = True
             
             # First, validate component assignments
             self._validate_component_assignments()
@@ -2550,7 +2762,7 @@ cdef class ConnectedMatterAgent:
                 print(f"WARNING: State {i} in path has overlapping blocks!")
         
         return combined_path
-            
+               
     def _fix_overlapping_blocks_in_path(self, path):
         """
         Fix any overlapping blocks in the path by removing duplicates
@@ -2567,22 +2779,4 @@ cdef class ConnectedMatterAgent:
                 
             fixed_path.append(fixed_state)
             
-        return fixed_path    
-            
-    def _fix_overlapping_blocks_in_path(self, path):
-        """
-        Fix any overlapping blocks in the path by removing duplicates
-        This is a last resort to ensure no overlapping blocks in the final path
-        """
-        fixed_path = []
-        for state in path:
-            # Convert to set to remove duplicates
-            fixed_state = list(set(state))
-            
-            # If we lost blocks in the conversion, print a warning
-            if len(fixed_state) != len(state):
-                print(f"WARNING: Removed {len(state) - len(fixed_state)} duplicate blocks in state")
-                
-            fixed_path.append(fixed_state)
-            
-        return fixed_path    
+        return fixed_path 
